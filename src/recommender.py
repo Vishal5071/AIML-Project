@@ -1,60 +1,69 @@
+import os
+import faiss
 import numpy as np
 import pandas as pd
-from src.data_loader import DataLoader
-from src.encoder import VectorEncoder
-from src.indexer import HNSWIndexer
+from src.data_loader import MovieDataLoader
+from src.encoder import SemanticEncoder
+from src.indexer import RecommendationIndices
 
-class ContentBasedRecommender:
-    def __init__(self, data_path: str):
-        self.df = DataLoader(data_path).load_data()
-        self.encoder = VectorEncoder()
-        
-        # Extract features and build index
-        self.vectors = self.encoder.encode(self.df['content'].tolist())
-        self.indexer = HNSWIndexer(dimension=self.encoder.get_dimension())
-        self.indexer.build_index(self.vectors)
-        
-        # Create a mapping for quick title lookups
-        # Converts to lower case for case-insensitive searching
-        self.title_to_idx = {
-            title.lower(): idx for idx, title in enumerate(self.df['title'])
-        }
+class ContentHNSWRecommender:
+    """Unified inference service with artifact caching."""
+    def __init__(self, data_path: str, artifacts_dir: str = "data/artifacts"):
+        self.data_path = data_path
+        self.artifacts_dir = artifacts_dir
+        os.makedirs(artifacts_dir, exist_ok=True)
 
-    def recommend(self, movie_title: str, top_k: int = 5) -> pd.DataFrame:
-        """Returns the top K similar movies based on content."""
-        movie_title_lower = movie_title.lower()
-        
-        if movie_title_lower not in self.title_to_idx:
-            # If movie isn't in database, we can encode the raw query directly!
-            # This is a major advantage of using semantic embeddings.
-            print(f"'{movie_title}' not found. Searching by semantic meaning instead...")
-            query_vector = self.encoder.encode([movie_title])[0]
+        self.df = None
+        self.vectors = None
+        self.encoder = SemanticEncoder()
+        self.indices = RecommendationIndices(self.encoder.embedding_dim)
+        self._initialize()
+
+    def _initialize(self):
+        meta_path = os.path.join(self.artifacts_dir, "movies_metadata.parquet")
+        vec_path = os.path.join(self.artifacts_dir, "embeddings.npy")
+        hnsw_path = os.path.join(self.artifacts_dir, "hnsw_index.faiss")
+
+        if os.path.exists(meta_path) and os.path.exists(vec_path) and os.path.exists(hnsw_path):
+            print("[INFO] Loading cached embeddings and FAISS index...")
+            self.df = pd.read_parquet(meta_path)
+            self.vectors = np.load(vec_path)
+            self.indices.hnsw_index = faiss.read_index(hnsw_path)
+            self.indices.build_exact(self.vectors)
         else:
-            # If it is in the database, fetch its pre-calculated vector
-            target_idx = self.title_to_idx[movie_title_lower]
-            query_vector = self.vectors[target_idx]
-            # Add 1 to top_k because the first result will be the movie itself
-            top_k += 1  
+            print("[INFO] Building artifacts from scratch...")
+            loader = MovieDataLoader(self.data_path)
+            self.df = loader.load_and_preprocess()
+            self.vectors = self.encoder.encode(self.df['dense_document'].tolist())
+            self.indices.build_exact(self.vectors)
+            self.indices.build_hnsw(self.vectors, M=32, ef_construction=200, ef_search=64)
 
-        # Query the HNSW index
-        distances, indices = self.indexer.search(query_vector, top_k=top_k)
-        
-        # Format the results
-        results = []
-        for dist, idx in zip(distances, indices):
-            if idx == -1: continue # FAISS returns -1 if it can't find enough neighbors
-            
-            movie = self.df.iloc[idx]
-            
-            # Skip the exact same movie being recommended to the user
-            if movie['title'].lower() == movie_title_lower:
-                continue
-                
-            results.append({
-                'Movie ID': movie['movieId'],
-                'Title': movie['title'],
-                'Genres': movie['genres'],
-                'Similarity Score': round(float(dist), 4)
-            })
-            
-        return pd.DataFrame(results).head(top_k if movie_title_lower not in self.title_to_idx else top_k-1)
+            # Persist artifacts
+            self.df.to_parquet(meta_path)
+            np.save(vec_path, self.vectors)
+            faiss.write_index(self.indices.hnsw_index, hnsw_path)
+
+        self.title_to_idx = {title.strip().lower(): idx for idx, title in enumerate(self.df['title'])}
+
+    def recommend_by_title(self, title: str, top_k: int = 10, method: str = 'hnsw') -> pd.DataFrame:
+        clean_title = title.strip().lower()
+        if clean_title not in self.title_to_idx:
+            raise KeyError(f"Movie '{title}' not found in database.")
+
+        idx = self.title_to_idx[clean_title]
+        query_vec = self.vectors[idx:idx+1]
+        search_k = top_k + 1
+
+        if method == 'hnsw':
+            scores, indices = self.indices.query_hnsw(query_vec, top_k=search_k)
+        elif method == 'exact':
+            scores, indices = self.indices.query_exact(query_vec, top_k=search_k)
+        else:
+            raise ValueError(f"Unknown method '{method}'. Choose 'hnsw' or 'exact'.")
+
+        result_indices = [i for i in indices[0] if i != idx][:top_k]
+        result_scores = [s for i, s in zip(indices[0], scores[0]) if i != idx][:top_k]
+
+        recs = self.df.iloc[result_indices].copy()
+        recs['similarity_score'] = result_scores
+        return recs[['movieId', 'title', 'genres', 'similarity_score']]
